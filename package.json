@@ -14,19 +14,29 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "serve": "node dist/server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "lint:eslint": "eslint src",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "src/**/*.ts": [
+      "eslint --fix --max-warnings=0"
+    ]
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "better-sqlite3": "^11.0.0",
-    "uuid": "^10.0.0",
-    "commander": "^12.0.0"
+    "commander": "^12.0.0",
+    "uuid": "^10.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@types/uuid": "^10.0.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.2",
     "typescript": "^5.7.0",
+    "typescript-eslint": "^8.58.0",
     "vitest": "^3.0.0"
   },
   "engines": {
