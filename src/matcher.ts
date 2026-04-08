@@ -1,6 +1,6 @@
 // src/matcher.ts - Keyword-based capability matching engine
 
-import { Agent, AgentCapability, MatchResult } from './types.js';
+import { type Agent, type AgentCapability, type MatchResult } from './types.js';
 
 // === Stopwords ===
 
