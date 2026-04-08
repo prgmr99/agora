@@ -113,6 +113,7 @@ program
 program
   .command('init')
   .description('Initialize Agora configuration and database')
+  // eslint-disable-next-line @typescript-eslint/require-await
   .action(async () => {
     console.log(`\n${BOLD}${CYAN}Initializing Agora...${RESET}\n`);
 

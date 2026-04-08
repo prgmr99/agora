@@ -11,12 +11,9 @@ export interface AgentCapability {
   tags: string[];
 }
 
-export interface AgentTransport {
-  type: 'stdio';
-  command: string;
-  args?: string[];
-  env?: Record<string, string>;
-}
+export type AgentTransport =
+  | { type: 'stdio'; command: string; args?: string[]; env?: Record<string, string> }
+  | { type: 'http'; url: string; headers?: Record<string, string> };
 
 export interface Agent {
   agent_id: string;
@@ -52,6 +49,9 @@ export interface Task {
   completed_at?: string;
   duration_ms?: number;
   error?: AgoraError;
+  attempts: number;
+  max_attempts: number;
+  next_retry_at?: number;  // epoch ms; undefined means no retry scheduled
 }
 
 // === Error Types ===
@@ -73,6 +73,7 @@ export type AgoraErrorCode =
   | 'TASK_NOT_FOUND'
   | 'TASK_TIMEOUT'
   | 'TASK_ALREADY_TERMINAL'
+  | 'INVALID_TRANSITION'
   | 'AGENT_ERROR'
   | 'SCHEMA_MISMATCH'
   | 'DB_ERROR'

@@ -1,10 +1,12 @@
 // src/tools.ts - Agora MVP MCP Tool Handlers
+/* eslint-disable @typescript-eslint/require-await */
 
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { AgoraDB } from './db.js';
+import { type McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { type AgoraDB } from './db.js';
 import { findBestAgents } from './matcher.js';
+import { type AgentExecutor } from './executor.js';
 import type {
   Agent,
   Task,
@@ -39,16 +41,23 @@ const CapabilitySchema = z.object({
   input_schema: z.record(z.string(), z.unknown()).optional().describe('Optional JSON schema for capability input'),
 });
 
-const TransportSchema = z.object({
-  type: z.literal('stdio').describe('Transport type (only stdio supported)'),
-  command: z.string().describe('Command to run the agent'),
-  args: z.array(z.string()).optional().describe('Command arguments'),
-  env: z.record(z.string(), z.string()).optional().describe('Environment variables'),
-});
+const TransportSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('stdio').describe('Transport type'),
+    command: z.string().describe('Command to run the agent'),
+    args: z.array(z.string()).optional().describe('Command arguments'),
+    env: z.record(z.string(), z.string()).optional().describe('Environment variables'),
+  }),
+  z.object({
+    type: z.literal('http').describe('Transport type'),
+    url: z.string().url().describe('HTTP endpoint URL'),
+    headers: z.record(z.string(), z.string()).optional().describe('Optional HTTP headers (e.g., auth)'),
+  }),
+]);
 
 // ─── registerTools ────────────────────────────────────────────────────────────
 
-export function registerTools(server: McpServer, db: AgoraDB): void {
+export function registerTools(server: McpServer, db: AgoraDB, executor?: AgentExecutor): void {
 
   // ── 1. agora_register_agent ─────────────────────────────────────────────────
   server.tool(
@@ -78,12 +87,18 @@ export function registerTools(server: McpServer, db: AgoraDB): void {
             tags: c.tags,
             ...(c.input_schema !== undefined ? { input_schema: c.input_schema } : {}),
           })),
-          transport: {
-            type: 'stdio',
-            command: params.transport.command,
-            ...(params.transport.args !== undefined ? { args: params.transport.args } : {}),
-            ...(params.transport.env !== undefined ? { env: params.transport.env as Record<string, string> } : {}),
-          },
+          transport: params.transport.type === 'stdio'
+            ? {
+                type: 'stdio' as const,
+                command: params.transport.command,
+                ...(params.transport.args !== undefined ? { args: params.transport.args } : {}),
+                ...(params.transport.env !== undefined ? { env: params.transport.env } : {}),
+              }
+            : {
+                type: 'http' as const,
+                url: params.transport.url,
+                ...(params.transport.headers !== undefined ? { headers: params.transport.headers } : {}),
+              },
           status: 'active',
           registered_at: now,
           last_seen_at: now,
@@ -209,50 +224,91 @@ export function registerTools(server: McpServer, db: AgoraDB): void {
         const timeoutMs = params.timeout_ms ?? 30000;
         const priority: TaskPriority = params.priority ?? 'normal';
 
-        let status: TaskStatus = 'pending';
-        let assignedAgentId: string | undefined;
-        let assignedAgentName: string | undefined;
-        let matchedCapability: string | undefined;
-        let matchConfidence: number | undefined;
+        // Use transaction for atomic match + insert (prevents double-assignment)
+        const insertResult = db.transaction(() => {
+          let txStatus: TaskStatus = 'pending';
+          let txAgentId: string | undefined;
+          let txAgentName: string | undefined;
+          let txCapability: string | undefined;
+          let txConfidence: number | undefined;
 
-        if (params.target_agent_id) {
-          const agent = db.getAgentById(params.target_agent_id);
-          if (!agent) {
-            return errorResult('AGENT_NOT_FOUND', `Target agent "${params.target_agent_id}" not found`);
+          if (params.target_agent_id) {
+            const agent = db.getAgentById(params.target_agent_id);
+            if (!agent) return { error: 'AGENT_NOT_FOUND' as const, message: `Target agent "${params.target_agent_id}" not found` };
+            txAgentId = agent.agent_id;
+            txAgentName = agent.name;
+            txStatus = 'assigned';
+          } else {
+            const agents = db.listAgents({ status: 'active' });
+            const matches = findBestAgents(params.description, agents, { topK: 1 });
+            if (matches.length > 0 && matches[0].confidence >= 0.5) {
+              const best = matches[0];
+              txAgentId = best.agent_id;
+              txAgentName = best.agent_name;
+              txCapability = best.matched_capability;
+              txConfidence = best.confidence;
+              txStatus = 'assigned';
+            }
           }
-          assignedAgentId = agent.agent_id;
-          assignedAgentName = agent.name;
-          status = 'assigned';
-        } else {
-          // Auto-route via matcher
-          const agents = db.listAgents({ status: 'active' });
-          const matches = findBestAgents(params.description, agents, { topK: 1 });
-          if (matches.length > 0 && matches[0].confidence >= 0.5) {
-            const best = matches[0];
-            assignedAgentId = best.agent_id;
-            assignedAgentName = best.agent_name;
-            matchedCapability = best.matched_capability;
-            matchConfidence = best.confidence;
-            status = 'assigned';
+
+          const task: Task = {
+            task_id: taskId,
+            description: params.description,
+            status: txStatus,
+            priority,
+            input: params.input,
+            assigned_agent_id: txAgentId,
+            assigned_agent_name: txAgentName,
+            matched_capability: txCapability,
+            match_confidence: txConfidence,
+            timeout_ms: timeoutMs,
+            created_at: now,
+            updated_at: now,
+            attempts: 0,
+            max_attempts: 1,
+          };
+
+          db.insertTask(task);
+          return { task, error: null };
+        });
+
+        if (insertResult.error) {
+          return errorResult(insertResult.error, insertResult.message ?? '');
+        }
+        const { task } = insertResult;
+        const { assigned_agent_id: assignedAgentId, assigned_agent_name: assignedAgentName, matched_capability: matchedCapability, match_confidence: matchConfidence, status } = task;
+
+        // Dispatch to agent if assigned and executor is available
+        if (executor && assignedAgentId) {
+          const dispatchAgent = db.getAgentById(assignedAgentId);
+          if (dispatchAgent) {
+            void executor.dispatch(task, dispatchAgent).catch(() => {
+              // On dispatch failure, increment attempts and schedule retry or mark failed
+              const current = db.getTask(task.task_id);
+              if (!current) return;
+              const attempts = (current.attempts ?? 0) + 1;
+              const maxAttempts = current.max_attempts ?? 1;
+              if (attempts < maxAttempts) {
+                // Exponential backoff: 1s, 4s, 16s, ...
+                const delayMs = Math.pow(4, attempts - 1) * 1000;
+                db.updateTask(task.task_id, {
+                  status: 'pending',
+                  attempts,
+                  next_retry_at: Date.now() + delayMs,
+                  updated_at: new Date().toISOString(),
+                });
+              } else {
+                db.updateTask(task.task_id, {
+                  status: 'failed',
+                  attempts,
+                  error: { code: 'AGENT_ERROR', message: 'Max dispatch attempts reached' },
+                  updated_at: new Date().toISOString(),
+                  completed_at: new Date().toISOString(),
+                });
+              }
+            });
           }
         }
-
-        const task: Task = {
-          task_id: taskId,
-          description: params.description,
-          status,
-          priority,
-          input: params.input,
-          assigned_agent_id: assignedAgentId,
-          assigned_agent_name: assignedAgentName,
-          matched_capability: matchedCapability,
-          match_confidence: matchConfidence,
-          timeout_ms: timeoutMs,
-          created_at: now,
-          updated_at: now,
-        };
-
-        db.insertTask(task);
 
         const response: Record<string, unknown> = {
           task_id: taskId,
@@ -332,8 +388,6 @@ export function registerTools(server: McpServer, db: AgoraDB): void {
     },
     async (params) => {
       try {
-        db.expireTimedOutTasks();
-
         const limit = params.limit ?? 20;
         const offset = params.offset ?? 0;
 
@@ -413,6 +467,111 @@ export function registerTools(server: McpServer, db: AgoraDB): void {
           previous_status: previousStatus,
           cancelled_at: now,
           ...(params.reason ? { reason: params.reason } : {}),
+        });
+      } catch (err) {
+        return errorResult('INTERNAL_ERROR', `Unexpected error: ${String(err)}`);
+      }
+    }
+  );
+
+  // ── 10. agora_heartbeat ─────────────────────────────────────────────────────
+  server.tool(
+    'agora_heartbeat',
+    'Signal that an agent is still alive (updates last_seen_at)',
+    {
+      agent_id: z.string().describe('ID of the agent sending the heartbeat'),
+    },
+    async (params) => {
+      try {
+        const agent = db.getAgentById(params.agent_id);
+        if (!agent) {
+          return errorResult('AGENT_NOT_FOUND', `Agent "${params.agent_id}" not found`);
+        }
+
+        db.touchAgent(params.agent_id);
+
+        return okResult({
+          agent_id: params.agent_id,
+          last_seen_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        return errorResult('INTERNAL_ERROR', `Unexpected error: ${String(err)}`);
+      }
+    }
+  );
+
+  // ── 9. agora_update_task ────────────────────────────────────────────────────
+  server.tool(
+    'agora_update_task',
+    'Update a task status and optionally write output or error',
+    {
+      task_id: z.string().describe('ID of the task to update'),
+      status: z.enum(['in_progress', 'completed', 'failed']).describe('New status for the task'),
+      output: z.record(z.string(), z.unknown()).optional().describe('Output data (for completed tasks)'),
+      error: z.object({
+        code: z.string(),
+        message: z.string(),
+      }).optional().describe('Error details (for failed tasks)'),
+    },
+    async (params) => {
+      try {
+        const task = db.getTask(params.task_id);
+        if (!task) {
+          return errorResult('TASK_NOT_FOUND', `Task "${params.task_id}" not found`);
+        }
+
+        if (TERMINAL_STATUSES.includes(task.status)) {
+          return errorResult(
+            'TASK_ALREADY_TERMINAL',
+            `Task "${params.task_id}" is already in terminal state "${task.status}"`
+          );
+        }
+
+        // Validate transitions
+        const allowedTransitions: Record<string, string[]> = {
+          pending: ['in_progress'],
+          assigned: ['in_progress'],
+          in_progress: ['completed', 'failed'],
+        };
+        const allowed = allowedTransitions[task.status] ?? [];
+        if (!allowed.includes(params.status)) {
+          return errorResult(
+            'INVALID_TRANSITION',
+            `Cannot transition task from "${task.status}" to "${params.status}". Allowed: ${allowed.join(', ') || 'none'}`
+          );
+        }
+
+        const now = new Date().toISOString();
+        const updates: Partial<Task> = {
+          status: params.status as Task['status'],
+          updated_at: now,
+        };
+
+        if (params.output !== undefined) {
+          updates.output = params.output;
+        }
+
+        if (params.error !== undefined) {
+          updates.error = { code: params.error.code as AgoraErrorCode, message: params.error.message };
+        }
+
+        if (params.status === 'completed' || params.status === 'failed') {
+          updates.completed_at = now;
+          updates.duration_ms = new Date(now).getTime() - new Date(task.created_at).getTime();
+        }
+
+        db.updateTask(params.task_id, updates);
+
+        if (params.status === 'completed' && task.assigned_agent_id) {
+          db.incrementTasksCompleted(task.assigned_agent_id);
+        }
+
+        return okResult({
+          task_id: params.task_id,
+          previous_status: task.status,
+          status: params.status,
+          updated_at: now,
+          ...(updates.completed_at ? { completed_at: updates.completed_at, duration_ms: updates.duration_ms } : {}),
         });
       } catch (err) {
         return errorResult('INTERNAL_ERROR', `Unexpected error: ${String(err)}`);

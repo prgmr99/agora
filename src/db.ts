@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import BetterSqlite3 from 'better-sqlite3';
-import type { Agent, Task } from './types.js';
+import type { Agent, AgentCapability, AgentTransport, AgoraError, Task } from './types.js';
 
 const DEFAULT_DB_PATH = path.join(os.homedir(), '.agora', 'agora.db');
 
@@ -36,6 +36,9 @@ interface TaskRow {
   completed_at: string | null;
   duration_ms: number | null;
   error: string | null;
+  attempts: number;
+  max_attempts: number;
+  next_retry_at: number | null;
 }
 
 function rowToAgent(row: AgentRow): Agent {
@@ -43,8 +46,8 @@ function rowToAgent(row: AgentRow): Agent {
     agent_id: row.agent_id,
     name: row.name,
     description: row.description,
-    capabilities: JSON.parse(row.capabilities),
-    transport: JSON.parse(row.transport),
+    capabilities: JSON.parse(row.capabilities) as AgentCapability[],
+    transport: JSON.parse(row.transport) as AgentTransport,
     status: row.status as Agent['status'],
     registered_at: row.registered_at,
     last_seen_at: row.last_seen_at,
@@ -58,8 +61,8 @@ function rowToTask(row: TaskRow): Task {
     description: row.description,
     status: row.status as Task['status'],
     priority: row.priority as Task['priority'],
-    input: row.input != null ? JSON.parse(row.input) : undefined,
-    output: row.output != null ? JSON.parse(row.output) : undefined,
+    input: row.input != null ? (JSON.parse(row.input) as Record<string, unknown>) : undefined,
+    output: row.output != null ? (JSON.parse(row.output) as Record<string, unknown>) : undefined,
     assigned_agent_id: row.assigned_agent_id ?? undefined,
     assigned_agent_name: row.assigned_agent_name ?? undefined,
     matched_capability: row.matched_capability ?? undefined,
@@ -69,7 +72,10 @@ function rowToTask(row: TaskRow): Task {
     updated_at: row.updated_at,
     completed_at: row.completed_at ?? undefined,
     duration_ms: row.duration_ms ?? undefined,
-    error: row.error != null ? JSON.parse(row.error) : undefined,
+    error: row.error != null ? (JSON.parse(row.error) as AgoraError) : undefined,
+    attempts: row.attempts,
+    max_attempts: row.max_attempts,
+    next_retry_at: row.next_retry_at ?? undefined,
   };
 }
 
@@ -89,6 +95,8 @@ export class AgoraDB {
   private stmtDeleteAgent!: BetterSqlite3.Statement<any[]>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private stmtIncrementTasksCompleted!: BetterSqlite3.Statement<any[]>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private stmtTouchAgent!: BetterSqlite3.Statement<any[]>;
 
   // Prepared statements - tasks
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -143,6 +151,9 @@ export class AgoraDB {
         completed_at TEXT,
         duration_ms INTEGER,
         error TEXT,
+        attempts INTEGER DEFAULT 0,
+        max_attempts INTEGER DEFAULT 1,
+        next_retry_at INTEGER,
         FOREIGN KEY (assigned_agent_id) REFERENCES agents(agent_id) ON DELETE SET NULL
       );
 
@@ -152,6 +163,18 @@ export class AgoraDB {
       CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(assigned_agent_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
     `);
+
+    // Migrate: add retry columns if not present (idempotent)
+    const cols = (this.db.prepare(`PRAGMA table_info(tasks)`).all() as Array<{ name: string }>).map(c => c.name);
+    if (!cols.includes('attempts')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN attempts INTEGER DEFAULT 0`);
+    }
+    if (!cols.includes('max_attempts')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN max_attempts INTEGER DEFAULT 1`);
+    }
+    if (!cols.includes('next_retry_at')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN next_retry_at INTEGER`);
+    }
   }
 
   private prepareStatements(): void {
@@ -189,11 +212,17 @@ export class AgoraDB {
       UPDATE agents SET tasks_completed = tasks_completed + 1 WHERE agent_id = ?
     `);
 
+    this.stmtTouchAgent = this.db.prepare(`
+      UPDATE agents SET last_seen_at = ? WHERE agent_id = ?
+    `);
+
     this.stmtInsertTask = this.db.prepare(`
       INSERT INTO tasks (task_id, description, status, priority, input, output, assigned_agent_id, assigned_agent_name,
-                         matched_capability, match_confidence, timeout_ms, created_at, updated_at, completed_at, duration_ms, error)
+                         matched_capability, match_confidence, timeout_ms, created_at, updated_at, completed_at, duration_ms, error,
+                         attempts, max_attempts, next_retry_at)
       VALUES (@task_id, @description, @status, @priority, @input, @output, @assigned_agent_id, @assigned_agent_name,
-              @matched_capability, @match_confidence, @timeout_ms, @created_at, @updated_at, @completed_at, @duration_ms, @error)
+              @matched_capability, @match_confidence, @timeout_ms, @created_at, @updated_at, @completed_at, @duration_ms, @error,
+              @attempts, @max_attempts, @next_retry_at)
     `);
 
     this.stmtGetTask = this.db.prepare(`
@@ -215,7 +244,10 @@ export class AgoraDB {
           updated_at = @updated_at,
           completed_at = @completed_at,
           duration_ms = @duration_ms,
-          error = @error
+          error = @error,
+          attempts = @attempts,
+          max_attempts = @max_attempts,
+          next_retry_at = @next_retry_at
       WHERE task_id = @task_id
     `);
 
@@ -311,6 +343,20 @@ export class AgoraDB {
     this.stmtIncrementTasksCompleted.run(id);
   }
 
+  touchAgent(id: string): void {
+    this.stmtTouchAgent.run(new Date().toISOString(), id);
+  }
+
+  markStaleAgentsInactive(cutoffIso: string): number {
+    const result = this.db
+      .prepare(
+        `UPDATE agents SET status = 'inactive'
+         WHERE status = 'active' AND last_seen_at < ?`
+      )
+      .run(cutoffIso);
+    return result.changes;
+  }
+
   // ─── Task operations ─────────────────────────────────────────────────────────
 
   insertTask(task: Task): void {
@@ -331,6 +377,9 @@ export class AgoraDB {
       completed_at: task.completed_at ?? null,
       duration_ms: task.duration_ms ?? null,
       error: task.error != null ? JSON.stringify(task.error) : null,
+      attempts: task.attempts ?? 0,
+      max_attempts: task.max_attempts ?? 1,
+      next_retry_at: task.next_retry_at ?? null,
     });
   }
 
@@ -398,6 +447,9 @@ export class AgoraDB {
       completed_at: merged.completed_at ?? null,
       duration_ms: merged.duration_ms ?? null,
       error: merged.error != null ? JSON.stringify(merged.error) : null,
+      attempts: merged.attempts ?? 0,
+      max_attempts: merged.max_attempts ?? 1,
+      next_retry_at: merged.next_retry_at ?? null,
     });
   }
 
@@ -411,19 +463,32 @@ export class AgoraDB {
 
   expireTimedOutTasks(): number {
     const now = Date.now();
-    // Find tasks where created_at (ms since epoch) + timeout_ms < now
-    // created_at is stored as ISO string, so we use strftime to convert
     const result = this.db
       .prepare(
         `UPDATE tasks
          SET status = 'timed_out', updated_at = ?
          WHERE status IN ('assigned', 'in_progress')
-           AND (
-             CAST((julianday(created_at) - julianday('1970-01-01')) * 86400000 AS INTEGER) + timeout_ms
-           ) < ?`
+           AND (CAST(strftime('%s', created_at) AS INTEGER) * 1000 + timeout_ms) < ?`
       )
       .run(new Date().toISOString(), now);
     return result.changes;
+  }
+
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  getRetryableTasks(): Task[] {
+    const now = Date.now();
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM tasks
+         WHERE status = 'pending'
+           AND next_retry_at IS NOT NULL
+           AND next_retry_at <= ?`
+      )
+      .all(now) as TaskRow[];
+    return rows.map(rowToTask);
   }
 
   close(): void {
