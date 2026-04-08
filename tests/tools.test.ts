@@ -31,6 +31,8 @@ function createTestTask(overrides?: Partial<Task>): Task {
     timeout_ms: 30000,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
+    attempts: 0,
+    max_attempts: 1,
     ...overrides,
   };
 }
@@ -333,5 +335,149 @@ describe('list tasks flow', () => {
     const completed = db.listTasks({ status: 'completed' });
     expect(completed.total).toBe(1);
     expect(completed.tasks[0].status).toBe('completed');
+  });
+});
+
+// Simulate agora_update_task
+function updateTask(
+  db: AgoraDB,
+  params: {
+    task_id: string;
+    status?: 'in_progress' | 'completed' | 'failed' | 'cancelled';
+    output?: Record<string, unknown>;
+    progress?: number;
+    error?: { code: string; message: string };
+  }
+): { status?: string; error?: string; idempotent?: boolean } {
+  const TERMINAL: TaskStatus[] = ['completed', 'failed', 'cancelled', 'timed_out'];
+  const task = db.getTask(params.task_id);
+  if (!task) return { error: `TASK_NOT_FOUND: Task "${params.task_id}" not found` };
+
+  if (TERMINAL.includes(task.status)) {
+    if (params.status === task.status) return { status: task.status, idempotent: true };
+    return { error: `TASK_ALREADY_TERMINAL: Task is in terminal state "${task.status}"` };
+  }
+
+  const allowedTransitions: Record<string, string[]> = {
+    pending: ['in_progress', 'cancelled'],
+    assigned: ['in_progress', 'cancelled'],
+    in_progress: ['completed', 'failed', 'cancelled'],
+  };
+
+  if (params.status === task.status && params.output === undefined && params.progress === undefined && params.error === undefined) {
+    return { status: task.status, idempotent: true };
+  }
+
+  if (params.status !== undefined && params.status !== task.status) {
+    const allowed = allowedTransitions[task.status] ?? [];
+    if (!allowed.includes(params.status)) {
+      return { error: `INVALID_TRANSITION: Cannot transition from "${task.status}" to "${params.status}"` };
+    }
+  }
+
+  const now = new Date().toISOString();
+  const updates: Partial<Task> = { updated_at: now };
+  if (params.status !== undefined) updates.status = params.status as Task['status'];
+  if (params.output !== undefined) updates.output = params.output;
+  if (params.progress !== undefined) updates.progress = params.progress;
+
+  const targetStatus = updates.status ?? task.status;
+  if (['completed', 'failed', 'cancelled'].includes(targetStatus)) {
+    updates.completed_at = now;
+    updates.duration_ms = new Date(now).getTime() - new Date(task.created_at).getTime();
+  }
+
+  db.updateTask(params.task_id, updates);
+  return { status: targetStatus };
+}
+
+describe('update task flow', () => {
+  it('pending → in_progress → completed lifecycle', () => {
+    const task = createTestTask({ status: 'pending' });
+    db.insertTask(task);
+
+    let result = updateTask(db, { task_id: task.task_id, status: 'in_progress' });
+    expect(result.error).toBeUndefined();
+    expect(db.getTask(task.task_id)!.status).toBe('in_progress');
+
+    result = updateTask(db, {
+      task_id: task.task_id,
+      status: 'completed',
+      output: { answer: 42 },
+    });
+    expect(result.error).toBeUndefined();
+
+    const final = db.getTask(task.task_id)!;
+    expect(final.status).toBe('completed');
+    expect(final.output).toEqual({ answer: 42 });
+    expect(final.completed_at).toBeDefined();
+    expect(final.duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('non-terminal → cancelled transition should be allowed', () => {
+    for (const fromStatus of ['pending', 'assigned', 'in_progress'] as const) {
+      const task = createTestTask({ task_id: uuidv4(), status: fromStatus });
+      db.insertTask(task);
+
+      const result = updateTask(db, { task_id: task.task_id, status: 'cancelled' });
+      expect(result.error).toBeUndefined();
+      expect(db.getTask(task.task_id)!.status).toBe('cancelled');
+    }
+  });
+
+  it('terminal state → any update should fail', () => {
+    for (const terminalStatus of ['completed', 'failed', 'cancelled', 'timed_out'] as const) {
+      const task = createTestTask({ task_id: uuidv4(), status: terminalStatus });
+      db.insertTask(task);
+
+      const result = updateTask(db, { task_id: task.task_id, status: 'in_progress' });
+      expect(result.error).toMatch(/TASK_ALREADY_TERMINAL/);
+    }
+  });
+
+  it('idempotency: same status re-request should not error', () => {
+    const task = createTestTask({ task_id: uuidv4(), status: 'in_progress' });
+    db.insertTask(task);
+
+    const result = updateTask(db, { task_id: task.task_id, status: 'in_progress' });
+    expect(result.error).toBeUndefined();
+    expect(result.idempotent).toBe(true);
+  });
+
+  it('partial update: progress without status change', () => {
+    const task = createTestTask({ task_id: uuidv4(), status: 'in_progress' });
+    db.insertTask(task);
+
+    const result = updateTask(db, { task_id: task.task_id, progress: 75 });
+    expect(result.error).toBeUndefined();
+
+    const updated = db.getTask(task.task_id)!;
+    expect(updated.status).toBe('in_progress');
+    expect(updated.progress).toBe(75);
+  });
+
+  it('invalid transition should fail with INVALID_TRANSITION', () => {
+    const task = createTestTask({ task_id: uuidv4(), status: 'pending' });
+    db.insertTask(task);
+
+    const result = updateTask(db, { task_id: task.task_id, status: 'completed' });
+    expect(result.error).toMatch(/INVALID_TRANSITION/);
+  });
+
+  it('TASK_NOT_FOUND for non-existent task', () => {
+    const result = updateTask(db, { task_id: 'non-existent-id', status: 'in_progress' });
+    expect(result.error).toMatch(/TASK_NOT_FOUND/);
+  });
+});
+
+describe('agora_get_task and agora_cancel_task TASK_NOT_FOUND', () => {
+  it('get non-existent task → TASK_NOT_FOUND', () => {
+    const task = db.getTask('does-not-exist');
+    expect(task).toBeNull();
+  });
+
+  it('cancel non-existent task → TASK_NOT_FOUND', () => {
+    const result = cancelTask(db, 'does-not-exist');
+    expect(result.error).toMatch(/TASK_NOT_FOUND/);
   });
 });

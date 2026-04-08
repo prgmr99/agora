@@ -28,6 +28,8 @@ function createTestTask(overrides?: Partial<Task>): Task {
     timeout_ms: 30000,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
+    attempts: 0,
+    max_attempts: 1,
     ...overrides,
   };
 }
@@ -241,5 +243,186 @@ describe('AgoraDB task operations', () => {
     const retrieved = db.getTask(task.task_id);
     expect(retrieved!.input).toEqual(input);
     expect(retrieved!.output).toEqual(output);
+  });
+});
+
+describe('AgoraDB expireTimedOutTasks', () => {
+  let agent: Agent;
+
+  beforeEach(() => {
+    agent = createTestAgent({ name: 'expire-agent' });
+    db.insertAgent(agent);
+  });
+
+  it('should mark assigned tasks as timed_out when past deadline', () => {
+    const oldCreatedAt = new Date(Date.now() - 60_000).toISOString();
+    const task = createTestTask({
+      status: 'assigned',
+      timeout_ms: 1,
+      created_at: oldCreatedAt,
+      assigned_agent_id: agent.agent_id,
+    });
+    db.insertTask(task);
+
+    const expired = db.expireTimedOutTasks();
+    expect(expired).toBe(1);
+
+    const updated = db.getTask(task.task_id);
+    expect(updated!.status).toBe('timed_out');
+  });
+
+  it('should not affect terminal state tasks', () => {
+    const oldCreatedAt = new Date(Date.now() - 60_000).toISOString();
+    const completed = createTestTask({ task_id: uuidv4(), status: 'completed', timeout_ms: 1, created_at: oldCreatedAt });
+    const cancelled = createTestTask({ task_id: uuidv4(), status: 'cancelled', timeout_ms: 1, created_at: oldCreatedAt });
+    const timedOut = createTestTask({ task_id: uuidv4(), status: 'timed_out', timeout_ms: 1, created_at: oldCreatedAt });
+    db.insertTask(completed);
+    db.insertTask(cancelled);
+    db.insertTask(timedOut);
+
+    const expired = db.expireTimedOutTasks();
+    expect(expired).toBe(0);
+
+    expect(db.getTask(completed.task_id)!.status).toBe('completed');
+    expect(db.getTask(cancelled.task_id)!.status).toBe('cancelled');
+    expect(db.getTask(timedOut.task_id)!.status).toBe('timed_out');
+  });
+
+  it('should not expire tasks that are still within timeout', () => {
+    const task = createTestTask({
+      status: 'in_progress',
+      timeout_ms: 999_999,
+    });
+    db.insertTask(task);
+
+    const expired = db.expireTimedOutTasks();
+    expect(expired).toBe(0);
+    expect(db.getTask(task.task_id)!.status).toBe('in_progress');
+  });
+});
+
+describe('AgoraDB heartbeat operations', () => {
+  it('touchAgent should update last_seen_at', async () => {
+    const agent = createTestAgent({ name: 'heartbeat-agent' });
+    const originalLastSeen = new Date(Date.now() - 5000).toISOString();
+    db.insertAgent({ ...agent, last_seen_at: originalLastSeen });
+
+    await new Promise((r) => setTimeout(r, 10));
+    db.touchAgent(agent.agent_id);
+
+    const updated = db.getAgentById(agent.agent_id);
+    expect(updated!.last_seen_at > originalLastSeen).toBe(true);
+  });
+
+  it('markStaleAgentsInactive should mark old agents inactive', () => {
+    const staleLastSeen = new Date(Date.now() - 200_000).toISOString();
+    const freshLastSeen = new Date().toISOString();
+
+    const staleAgent = createTestAgent({ agent_id: uuidv4(), name: 'stale-agent', last_seen_at: staleLastSeen });
+    const freshAgent = createTestAgent({ agent_id: uuidv4(), name: 'fresh-agent', last_seen_at: freshLastSeen });
+    db.insertAgent(staleAgent);
+    db.insertAgent(freshAgent);
+
+    const cutoff = new Date(Date.now() - 90_000).toISOString();
+    const changed = db.markStaleAgentsInactive(cutoff);
+
+    expect(changed).toBe(1);
+    expect(db.getAgentById(staleAgent.agent_id)!.status).toBe('inactive');
+    expect(db.getAgentById(freshAgent.agent_id)!.status).toBe('active');
+  });
+});
+
+describe('AgoraDB getRecentTasks + getAgentStats', () => {
+  it('getRecentTasks should return tasks ordered by created_at DESC', () => {
+    const task1 = createTestTask({ task_id: uuidv4(), description: 'first', created_at: new Date(Date.now() - 2000).toISOString() });
+    const task2 = createTestTask({ task_id: uuidv4(), description: 'second', created_at: new Date(Date.now() - 1000).toISOString() });
+    const task3 = createTestTask({ task_id: uuidv4(), description: 'third', created_at: new Date().toISOString() });
+    db.insertTask(task1);
+    db.insertTask(task2);
+    db.insertTask(task3);
+
+    const recent = db.getRecentTasks(3);
+    expect(recent.length).toBe(3);
+    expect(recent[0].description).toBe('third');
+    expect(recent[1].description).toBe('second');
+    expect(recent[2].description).toBe('first');
+  });
+
+  it('getRecentTasks should respect limit', () => {
+    for (let i = 0; i < 5; i++) {
+      db.insertTask(createTestTask({ task_id: uuidv4(), description: `task ${i}` }));
+    }
+    const recent = db.getRecentTasks(3);
+    expect(recent.length).toBe(3);
+  });
+
+  it('getAgentStats should count active/inactive agents', () => {
+    const a1 = createTestAgent({ agent_id: uuidv4(), name: 'a1', status: 'active', tasks_completed: 5 });
+    const a2 = createTestAgent({ agent_id: uuidv4(), name: 'a2', status: 'active', tasks_completed: 3 });
+    const a3 = createTestAgent({ agent_id: uuidv4(), name: 'a3', status: 'inactive', tasks_completed: 10 });
+    db.insertAgent(a1);
+    db.insertAgent(a2);
+    db.insertAgent(a3);
+
+    const stats = db.getAgentStats();
+    expect(stats.active).toBe(2);
+    expect(stats.inactive).toBe(1);
+    expect(stats.avgTasksCompleted).toBeCloseTo((5 + 3 + 10) / 3, 1);
+  });
+
+  it('getAgentStats should return zeros when no agents', () => {
+    const stats = db.getAgentStats();
+    expect(stats.active).toBe(0);
+    expect(stats.inactive).toBe(0);
+    expect(stats.avgTasksCompleted).toBe(0);
+  });
+});
+
+describe('AgoraDB listTasks pagination', () => {
+  beforeEach(() => {
+    for (let i = 0; i < 5; i++) {
+      db.insertTask(createTestTask({ task_id: uuidv4(), description: `task ${i}` }));
+    }
+  });
+
+  it('should respect limit', () => {
+    const result = db.listTasks({ limit: 2 });
+    expect(result.tasks.length).toBe(2);
+    expect(result.total).toBe(5);
+  });
+
+  it('should respect offset', () => {
+    const all = db.listTasks({ limit: 5 });
+    const paged = db.listTasks({ limit: 2, offset: 2 });
+    expect(paged.tasks.length).toBe(2);
+    expect(paged.tasks[0].task_id).toBe(all.tasks[2].task_id);
+  });
+});
+
+describe('AgoraDB progress field', () => {
+  it('should persist and retrieve progress field', () => {
+    const task = createTestTask({ progress: 42 });
+    db.insertTask(task);
+
+    const retrieved = db.getTask(task.task_id);
+    expect(retrieved!.progress).toBe(42);
+  });
+
+  it('should update progress field', () => {
+    const task = createTestTask({ progress: 0 });
+    db.insertTask(task);
+
+    db.updateTask(task.task_id, { progress: 75, updated_at: new Date().toISOString() });
+
+    const updated = db.getTask(task.task_id);
+    expect(updated!.progress).toBe(75);
+  });
+
+  it('should allow undefined progress', () => {
+    const task = createTestTask();
+    db.insertTask(task);
+
+    const retrieved = db.getTask(task.task_id);
+    expect(retrieved!.progress).toBeUndefined();
   });
 });
