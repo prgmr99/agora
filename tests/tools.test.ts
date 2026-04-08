@@ -468,6 +468,23 @@ describe('update task flow', () => {
     const result = updateTask(db, { task_id: 'non-existent-id', status: 'in_progress' });
     expect(result.error).toMatch(/TASK_NOT_FOUND/);
   });
+
+  it('transitioning to in_progress should set lease_expires_at', () => {
+    const task = createTestTask({ task_id: uuidv4(), status: 'pending' });
+    db.insertTask(task);
+
+    const before = Date.now();
+    db.updateTask(task.task_id, {
+      status: 'in_progress',
+      lease_expires_at: Date.now() + 30_000,
+      attempt_count: 1,
+      updated_at: new Date().toISOString(),
+    });
+
+    const updated = db.getTask(task.task_id)!;
+    expect(updated.lease_expires_at).toBeGreaterThan(before);
+    expect(updated.attempt_count).toBe(1);
+  });
 });
 
 describe('agora_get_task and agora_cancel_task TASK_NOT_FOUND', () => {

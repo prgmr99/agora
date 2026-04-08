@@ -399,6 +399,87 @@ describe('AgoraDB listTasks pagination', () => {
   });
 });
 
+describe('AgoraDB task lease operations', () => {
+  it('reclaimExpiredLeases should reclaim in_progress tasks with expired leases', () => {
+    const expiredLease = Date.now() - 1000; // expired 1s ago
+    const task = createTestTask({
+      status: 'in_progress',
+      lease_expires_at: expiredLease,
+    });
+    db.insertTask(task);
+
+    const reclaimed = db.reclaimExpiredLeases();
+    expect(reclaimed).toBe(1);
+
+    const updated = db.getTask(task.task_id)!;
+    expect(updated.status).toBe('pending');
+    expect(updated.assigned_agent_id).toBeUndefined();
+    expect(updated.lease_expires_at).toBeUndefined();
+  });
+
+  it('reclaimExpiredLeases should not reclaim tasks with valid leases', () => {
+    const validLease = Date.now() + 30_000; // expires in 30s
+    const task = createTestTask({
+      status: 'in_progress',
+      lease_expires_at: validLease,
+    });
+    db.insertTask(task);
+
+    const reclaimed = db.reclaimExpiredLeases();
+    expect(reclaimed).toBe(0);
+    expect(db.getTask(task.task_id)!.status).toBe('in_progress');
+  });
+
+  it('reclaimExpiredLeases should not affect tasks without a lease', () => {
+    const task = createTestTask({ status: 'in_progress' }); // no lease
+    db.insertTask(task);
+
+    const reclaimed = db.reclaimExpiredLeases();
+    expect(reclaimed).toBe(0);
+    expect(db.getTask(task.task_id)!.status).toBe('in_progress');
+  });
+
+  it('renewTaskLease should extend lease_expires_at', async () => {
+    const initialLease = Date.now() + 5_000;
+    const task = createTestTask({
+      status: 'in_progress',
+      lease_expires_at: initialLease,
+      lease_duration_ms: 30_000,
+    });
+    db.insertTask(task);
+
+    await new Promise((r) => setTimeout(r, 10));
+    const renewed = db.renewTaskLease(task.task_id, 30_000);
+    expect(renewed).toBe(true);
+
+    const updated = db.getTask(task.task_id)!;
+    expect(updated.lease_expires_at!).toBeGreaterThan(initialLease);
+  });
+
+  it('renewTaskLease should return false for non-in_progress tasks', () => {
+    const task = createTestTask({ status: 'pending' });
+    db.insertTask(task);
+
+    const renewed = db.renewTaskLease(task.task_id, 30_000);
+    expect(renewed).toBe(false);
+  });
+
+  it('lease fields should round-trip through insert/get', () => {
+    const leaseExpiry = Date.now() + 30_000;
+    const task = createTestTask({
+      lease_expires_at: leaseExpiry,
+      lease_duration_ms: 30_000,
+      attempt_count: 2,
+    });
+    db.insertTask(task);
+
+    const retrieved = db.getTask(task.task_id)!;
+    expect(retrieved.lease_expires_at).toBe(leaseExpiry);
+    expect(retrieved.lease_duration_ms).toBe(30_000);
+    expect(retrieved.attempt_count).toBe(2);
+  });
+});
+
 describe('AgoraDB progress field', () => {
   it('should persist and retrieve progress field', () => {
     const task = createTestTask({ progress: 42 });

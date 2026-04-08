@@ -500,6 +500,52 @@ export function registerTools(server: McpServer, db: AgoraDB, executor?: AgentEx
     }
   );
 
+  // ── 11. agora_renew_lease ────────────────────────────────────────────────────
+  server.tool(
+    'agora_renew_lease',
+    'Renew the execution lease on an in_progress task to prevent automatic reclaim',
+    {
+      task_id: z.string().describe('ID of the task whose lease to renew'),
+      extend_ms: z.number().int().positive().optional()
+        .describe('How many ms to extend the lease (default: task lease_duration_ms or 30000)'),
+    },
+    async (params) => {
+      try {
+        const task = db.getTask(params.task_id);
+        if (!task) {
+          return errorResult('TASK_NOT_FOUND', `Task "${params.task_id}" not found`);
+        }
+        if (task.status !== 'in_progress') {
+          return errorResult(
+            'INVALID_TRANSITION',
+            `Cannot renew lease on task with status "${task.status}" — must be in_progress`
+          );
+        }
+        if (task.lease_expires_at == null) {
+          return errorResult(
+            'INTERNAL_ERROR',
+            `Task "${params.task_id}" has no active lease`
+          );
+        }
+
+        const extendMs = params.extend_ms ?? task.lease_duration_ms ?? 30_000;
+        const renewed = db.renewTaskLease(params.task_id, extendMs);
+        if (!renewed) {
+          return errorResult('INTERNAL_ERROR', `Failed to renew lease for task "${params.task_id}"`);
+        }
+
+        const newExpiry = Date.now() + extendMs;
+        return okResult({
+          task_id: params.task_id,
+          lease_expires_at: newExpiry,
+          extended_by_ms: extendMs,
+        });
+      } catch (err) {
+        return errorResult('INTERNAL_ERROR', `Unexpected error: ${String(err)}`);
+      }
+    }
+  );
+
   // ── 9. agora_update_task ────────────────────────────────────────────────────
   server.tool(
     'agora_update_task',
@@ -558,6 +604,12 @@ export function registerTools(server: McpServer, db: AgoraDB, executor?: AgentEx
             );
           }
           updates.status = params.status as Task['status'];
+          if (params.status === 'in_progress') {
+            const leaseDuration = task.lease_duration_ms ?? 30_000;
+            updates.lease_expires_at = Date.now() + leaseDuration;
+            updates.lease_duration_ms = leaseDuration;
+            updates.attempt_count = (task.attempt_count ?? 0) + 1;
+          }
         }
 
         // Idempotency: same status, no other fields — return early without DB write
@@ -580,6 +632,7 @@ export function registerTools(server: McpServer, db: AgoraDB, executor?: AgentEx
         if (targetStatus === 'completed' || targetStatus === 'failed' || targetStatus === 'cancelled') {
           updates.completed_at = now;
           updates.duration_ms = new Date(now).getTime() - new Date(task.created_at).getTime();
+          updates.lease_expires_at = undefined;  // clear lease on terminal
         }
 
         db.updateTask(params.task_id, updates);

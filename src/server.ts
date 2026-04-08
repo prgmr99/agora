@@ -71,11 +71,18 @@ export function createServer(dbPath?: string): McpServer {
   }, 10_000);
   retrySweeper.unref();
 
+  // Reclaim expired task leases every 5 seconds (crash recovery)
+  const leaseSweeper = setInterval(() => {
+    db.reclaimExpiredLeases();
+  }, 5_000);
+  leaseSweeper.unref();
+
   // Handle graceful shutdown
   process.on('SIGINT', () => {
     clearInterval(timeoutSweeper);
     clearInterval(healthSweeper);
     clearInterval(retrySweeper);
+    clearInterval(leaseSweeper);
     executor.closeAll().catch(() => {});
     db.close();
     process.exit(0);
@@ -84,6 +91,7 @@ export function createServer(dbPath?: string): McpServer {
     clearInterval(timeoutSweeper);
     clearInterval(healthSweeper);
     clearInterval(retrySweeper);
+    clearInterval(leaseSweeper);
     executor.closeAll().catch(() => {});
     db.close();
     process.exit(0);

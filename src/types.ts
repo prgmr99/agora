@@ -53,6 +53,9 @@ export interface Task {
   attempts: number;
   max_attempts: number;
   next_retry_at?: number;  // epoch ms; undefined means no retry scheduled
+  lease_expires_at?: number;   // epoch ms; set when status → in_progress
+  lease_duration_ms?: number;  // how long each lease lasts (default 30000)
+  attempt_count?: number;      // how many times task has been dispatched
 }
 
 // === Error Types ===

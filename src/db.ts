@@ -40,6 +40,9 @@ interface TaskRow {
   max_attempts: number;
   next_retry_at: number | null;
   progress: number | null;
+  lease_expires_at: number | null;
+  lease_duration_ms: number | null;
+  attempt_count: number;
 }
 
 function rowToAgent(row: AgentRow): Agent {
@@ -78,6 +81,9 @@ function rowToTask(row: TaskRow): Task {
     max_attempts: row.max_attempts,
     next_retry_at: row.next_retry_at ?? undefined,
     progress: row.progress ?? undefined,
+    lease_expires_at: row.lease_expires_at ?? undefined,
+    lease_duration_ms: row.lease_duration_ms ?? undefined,
+    attempt_count: row.attempt_count ?? 0,
   };
 }
 
@@ -157,6 +163,9 @@ export class AgoraDB {
         max_attempts INTEGER DEFAULT 1,
         next_retry_at INTEGER,
         progress INTEGER CHECK(progress >= 0 AND progress <= 100),
+        lease_expires_at INTEGER,
+        lease_duration_ms INTEGER DEFAULT 30000,
+        attempt_count INTEGER DEFAULT 0,
         FOREIGN KEY (assigned_agent_id) REFERENCES agents(agent_id) ON DELETE SET NULL
       );
 
@@ -180,6 +189,15 @@ export class AgoraDB {
     }
     if (!cols.includes('progress')) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN progress INTEGER CHECK(progress >= 0 AND progress <= 100)`);
+    }
+    if (!cols.includes('lease_expires_at')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN lease_expires_at INTEGER`);
+    }
+    if (!cols.includes('lease_duration_ms')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN lease_duration_ms INTEGER DEFAULT 30000`);
+    }
+    if (!cols.includes('attempt_count')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN attempt_count INTEGER DEFAULT 0`);
     }
   }
 
@@ -225,10 +243,10 @@ export class AgoraDB {
     this.stmtInsertTask = this.db.prepare(`
       INSERT INTO tasks (task_id, description, status, priority, input, output, assigned_agent_id, assigned_agent_name,
                          matched_capability, match_confidence, timeout_ms, created_at, updated_at, completed_at, duration_ms, error,
-                         attempts, max_attempts, next_retry_at, progress)
+                         attempts, max_attempts, next_retry_at, progress, lease_expires_at, lease_duration_ms, attempt_count)
       VALUES (@task_id, @description, @status, @priority, @input, @output, @assigned_agent_id, @assigned_agent_name,
               @matched_capability, @match_confidence, @timeout_ms, @created_at, @updated_at, @completed_at, @duration_ms, @error,
-              @attempts, @max_attempts, @next_retry_at, @progress)
+              @attempts, @max_attempts, @next_retry_at, @progress, @lease_expires_at, @lease_duration_ms, @attempt_count)
     `);
 
     this.stmtGetTask = this.db.prepare(`
@@ -254,7 +272,10 @@ export class AgoraDB {
           attempts = @attempts,
           max_attempts = @max_attempts,
           next_retry_at = @next_retry_at,
-          progress = @progress
+          progress = @progress,
+          lease_expires_at = @lease_expires_at,
+          lease_duration_ms = @lease_duration_ms,
+          attempt_count = @attempt_count
       WHERE task_id = @task_id
     `);
 
@@ -388,6 +409,9 @@ export class AgoraDB {
       max_attempts: task.max_attempts ?? 1,
       next_retry_at: task.next_retry_at ?? null,
       progress: task.progress ?? null,
+      lease_expires_at: task.lease_expires_at ?? null,
+      lease_duration_ms: task.lease_duration_ms ?? null,
+      attempt_count: task.attempt_count ?? 0,
     });
   }
 
@@ -459,6 +483,9 @@ export class AgoraDB {
       max_attempts: merged.max_attempts ?? 1,
       next_retry_at: merged.next_retry_at ?? null,
       progress: merged.progress ?? null,
+      lease_expires_at: merged.lease_expires_at ?? null,
+      lease_duration_ms: merged.lease_duration_ms ?? null,
+      attempt_count: merged.attempt_count ?? 0,
     });
   }
 
@@ -498,6 +525,36 @@ export class AgoraDB {
       )
       .all(now) as TaskRow[];
     return rows.map(rowToTask);
+  }
+
+  reclaimExpiredLeases(): number {
+    const now = Date.now();
+    const result = this.db
+      .prepare(
+        `UPDATE tasks
+         SET status = 'pending',
+             assigned_agent_id = NULL,
+             assigned_agent_name = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?
+         WHERE status = 'in_progress'
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at < ?`
+      )
+      .run(new Date().toISOString(), now);
+    return result.changes;
+  }
+
+  renewTaskLease(taskId: string, extendMs: number): boolean {
+    const task = this.getTask(taskId);
+    if (!task || task.status !== 'in_progress' || task.lease_expires_at == null) {
+      return false;
+    }
+    const newExpiry = Date.now() + extendMs;
+    this.db
+      .prepare(`UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?`)
+      .run(newExpiry, new Date().toISOString(), taskId);
+    return true;
   }
 
   getRecentTasks(limit = 20): Task[] {
