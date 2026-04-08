@@ -503,11 +503,13 @@ export function registerTools(server: McpServer, db: AgoraDB, executor?: AgentEx
   // ── 9. agora_update_task ────────────────────────────────────────────────────
   server.tool(
     'agora_update_task',
-    'Update a task status and optionally write output or error',
+    'Update task status, output, progress, or error. Status is optional for partial updates.',
     {
       task_id: z.string().describe('ID of the task to update'),
-      status: z.enum(['in_progress', 'completed', 'failed']).describe('New status for the task'),
-      output: z.record(z.string(), z.unknown()).optional().describe('Output data (for completed tasks)'),
+      status: z.enum(['in_progress', 'completed', 'failed', 'cancelled']).optional()
+        .describe('New status (omit to update output/progress only)'),
+      output: z.record(z.string(), z.unknown()).optional().describe('Output data'),
+      progress: z.number().min(0).max(100).optional().describe('Progress percentage (0–100)'),
       error: z.object({
         code: z.string(),
         message: z.string(),
@@ -520,57 +522,78 @@ export function registerTools(server: McpServer, db: AgoraDB, executor?: AgentEx
           return errorResult('TASK_NOT_FOUND', `Task "${params.task_id}" not found`);
         }
 
+        // Terminal state check
         if (TERMINAL_STATUSES.includes(task.status)) {
+          // Idempotency: same status requested on already-terminal task
+          if (params.status === task.status) {
+            return okResult({
+              task_id: params.task_id,
+              status: task.status,
+              updated_at: task.updated_at,
+              idempotent: true,
+            });
+          }
           return errorResult(
             'TASK_ALREADY_TERMINAL',
             `Task "${params.task_id}" is already in terminal state "${task.status}"`
           );
         }
 
-        // Validate transitions
-        const allowedTransitions: Record<string, string[]> = {
-          pending: ['in_progress'],
-          assigned: ['in_progress'],
-          in_progress: ['completed', 'failed'],
-        };
-        const allowed = allowedTransitions[task.status] ?? [];
-        if (!allowed.includes(params.status)) {
-          return errorResult(
-            'INVALID_TRANSITION',
-            `Cannot transition task from "${task.status}" to "${params.status}". Allowed: ${allowed.join(', ') || 'none'}`
-          );
-        }
-
         const now = new Date().toISOString();
-        const updates: Partial<Task> = {
-          status: params.status as Task['status'],
-          updated_at: now,
-        };
+        const updates: Partial<Task> = { updated_at: now };
 
-        if (params.output !== undefined) {
-          updates.output = params.output;
+        // Handle status transition
+        if (params.status !== undefined && params.status !== task.status) {
+          // Allowed transitions
+          const allowedTransitions: Record<string, string[]> = {
+            pending: ['in_progress', 'cancelled'],
+            assigned: ['in_progress', 'cancelled'],
+            in_progress: ['completed', 'failed', 'cancelled'],
+          };
+          const allowed = allowedTransitions[task.status] ?? [];
+          if (!allowed.includes(params.status)) {
+            return errorResult(
+              'INVALID_TRANSITION',
+              `Cannot transition task from "${task.status}" to "${params.status}". Allowed: ${allowed.join(', ') || 'none'}`
+            );
+          }
+          updates.status = params.status as Task['status'];
         }
 
+        // Idempotency: same status, no other fields — return early without DB write
+        if (params.status === task.status && params.output === undefined && params.progress === undefined && params.error === undefined) {
+          return okResult({
+            task_id: params.task_id,
+            status: task.status,
+            updated_at: task.updated_at,
+            idempotent: true,
+          });
+        }
+
+        if (params.output !== undefined) updates.output = params.output;
+        if (params.progress !== undefined) updates.progress = params.progress;
         if (params.error !== undefined) {
           updates.error = { code: params.error.code as AgoraErrorCode, message: params.error.message };
         }
 
-        if (params.status === 'completed' || params.status === 'failed') {
+        const targetStatus = updates.status ?? task.status;
+        if (targetStatus === 'completed' || targetStatus === 'failed' || targetStatus === 'cancelled') {
           updates.completed_at = now;
           updates.duration_ms = new Date(now).getTime() - new Date(task.created_at).getTime();
         }
 
         db.updateTask(params.task_id, updates);
 
-        if (params.status === 'completed' && task.assigned_agent_id) {
+        if (targetStatus === 'completed' && task.assigned_agent_id) {
           db.incrementTasksCompleted(task.assigned_agent_id);
         }
 
         return okResult({
           task_id: params.task_id,
           previous_status: task.status,
-          status: params.status,
+          status: targetStatus,
           updated_at: now,
+          ...(updates.progress !== undefined ? { progress: updates.progress } : {}),
           ...(updates.completed_at ? { completed_at: updates.completed_at, duration_ms: updates.duration_ms } : {}),
         });
       } catch (err) {

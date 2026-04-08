@@ -172,4 +172,15 @@ program
     await startServer(options.db);
   });
 
+program
+  .command('board')
+  .description('Open real-time TUI dashboard')
+  .option('--db <path>', 'Custom database path')
+  .action(async (options: { db?: string }) => {
+    const { render } = await import('ink');
+    const React = await import('react');
+    const { Board } = await import('./board.js');
+    render(React.default.createElement(Board, { dbPath: options.db }));
+  });
+
 program.parse();

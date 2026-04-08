@@ -48,3 +48,14 @@ Agora is an MCP server that acts as a smart task router for AI agents. Agents re
 - **Task status flow:** `pending → assigned → in_progress → completed | failed | timed_out | cancelled`
 - **Config location:** `~/.agora/config.json`; DB default: `~/.agora/agora.db`
 - **Matching threshold:** `min_confidence: 0.1`, auto-assign at `0.5` (configurable in config)
+
+## Spec Workflow
+
+기능 명세서나 기획 제안서가 주어지면 다음 순서로 작업한다:
+
+1. **Spec 저장** — `.claude/spec/<feature-name>.md`에 명세 저장 (기존 파일이 있으면 업데이트)
+2. **CLAUDE.md 업데이트** — 새 컨벤션이나 명령어가 추가되면 이 파일에 반영
+3. **순차 구현** — 명세의 구현 계획(Step 순서)을 따라 기능 구현
+4. **커밋** — 구현 완료 후 `feat/v1-*` 또는 `feat/<feature>` 브랜치에 커밋
+
+Spec 파일은 구현의 단일 진실 소스(single source of truth)로 활용하며, 구현 중 설계 변경이 생기면 spec도 함께 업데이트한다.

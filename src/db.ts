@@ -39,6 +39,7 @@ interface TaskRow {
   attempts: number;
   max_attempts: number;
   next_retry_at: number | null;
+  progress: number | null;
 }
 
 function rowToAgent(row: AgentRow): Agent {
@@ -76,6 +77,7 @@ function rowToTask(row: TaskRow): Task {
     attempts: row.attempts,
     max_attempts: row.max_attempts,
     next_retry_at: row.next_retry_at ?? undefined,
+    progress: row.progress ?? undefined,
   };
 }
 
@@ -154,6 +156,7 @@ export class AgoraDB {
         attempts INTEGER DEFAULT 0,
         max_attempts INTEGER DEFAULT 1,
         next_retry_at INTEGER,
+        progress INTEGER CHECK(progress >= 0 AND progress <= 100),
         FOREIGN KEY (assigned_agent_id) REFERENCES agents(agent_id) ON DELETE SET NULL
       );
 
@@ -174,6 +177,9 @@ export class AgoraDB {
     }
     if (!cols.includes('next_retry_at')) {
       this.db.exec(`ALTER TABLE tasks ADD COLUMN next_retry_at INTEGER`);
+    }
+    if (!cols.includes('progress')) {
+      this.db.exec(`ALTER TABLE tasks ADD COLUMN progress INTEGER CHECK(progress >= 0 AND progress <= 100)`);
     }
   }
 
@@ -219,10 +225,10 @@ export class AgoraDB {
     this.stmtInsertTask = this.db.prepare(`
       INSERT INTO tasks (task_id, description, status, priority, input, output, assigned_agent_id, assigned_agent_name,
                          matched_capability, match_confidence, timeout_ms, created_at, updated_at, completed_at, duration_ms, error,
-                         attempts, max_attempts, next_retry_at)
+                         attempts, max_attempts, next_retry_at, progress)
       VALUES (@task_id, @description, @status, @priority, @input, @output, @assigned_agent_id, @assigned_agent_name,
               @matched_capability, @match_confidence, @timeout_ms, @created_at, @updated_at, @completed_at, @duration_ms, @error,
-              @attempts, @max_attempts, @next_retry_at)
+              @attempts, @max_attempts, @next_retry_at, @progress)
     `);
 
     this.stmtGetTask = this.db.prepare(`
@@ -247,7 +253,8 @@ export class AgoraDB {
           error = @error,
           attempts = @attempts,
           max_attempts = @max_attempts,
-          next_retry_at = @next_retry_at
+          next_retry_at = @next_retry_at,
+          progress = @progress
       WHERE task_id = @task_id
     `);
 
@@ -380,6 +387,7 @@ export class AgoraDB {
       attempts: task.attempts ?? 0,
       max_attempts: task.max_attempts ?? 1,
       next_retry_at: task.next_retry_at ?? null,
+      progress: task.progress ?? null,
     });
   }
 
@@ -450,6 +458,7 @@ export class AgoraDB {
       attempts: merged.attempts ?? 0,
       max_attempts: merged.max_attempts ?? 1,
       next_retry_at: merged.next_retry_at ?? null,
+      progress: merged.progress ?? null,
     });
   }
 
@@ -489,6 +498,30 @@ export class AgoraDB {
       )
       .all(now) as TaskRow[];
     return rows.map(rowToTask);
+  }
+
+  getRecentTasks(limit = 20): Task[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?`)
+      .all(limit) as TaskRow[];
+    return rows.map(rowToTask);
+  }
+
+  getAgentStats(): { active: number; inactive: number; avgTasksCompleted: number } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
+           SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) AS inactive,
+           AVG(tasks_completed) AS avgTasksCompleted
+         FROM agents`
+      )
+      .get() as { active: number | null; inactive: number | null; avgTasksCompleted: number | null };
+    return {
+      active: row.active ?? 0,
+      inactive: row.inactive ?? 0,
+      avgTasksCompleted: row.avgTasksCompleted ?? 0,
+    };
   }
 
   close(): void {

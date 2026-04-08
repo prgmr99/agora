@@ -49,6 +49,7 @@ export interface Task {
   completed_at?: string;
   duration_ms?: number;
   error?: AgoraError;
+  progress?: number;  // 0–100, optional progress percentage
   attempts: number;
   max_attempts: number;
   next_retry_at?: number;  // epoch ms; undefined means no retry scheduled
